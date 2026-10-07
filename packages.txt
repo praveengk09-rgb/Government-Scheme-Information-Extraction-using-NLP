@@ -2,3 +2,4 @@ tesseract-ocr
 tesseract-ocr-mar
 tesseract-ocr-eng
 libgl1
+chromium

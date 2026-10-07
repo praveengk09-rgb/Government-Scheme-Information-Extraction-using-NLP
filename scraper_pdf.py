@@ -205,34 +205,34 @@ def is_listing_or_search_page(soup: BeautifulSoup, url: str, text: str) -> bool:
     return False
 
 
-def scrape_text_from_url(url: str) -> str:
-    """
-    Scrapes text content from a web URL using requests and BeautifulSoup.
-    Handles government websites with realistic headers, proper timeouts,
-    removes scripts/styles, extracts headings, paragraphs, lists, and tables.
-    Detects listing/search pages gracefully.
-    """
+_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+MIN_STATIC_CHARS = 400  # shorter than this usually means a JavaScript-rendered shell
+
+
+def _normalize_url(url: str) -> str:
     if not url or not isinstance(url, str):
         raise ValueError("Invalid or empty URL provided.")
-
     url = url.strip()
     if not (url.startswith("http://") or url.startswith("https://")):
         url = "https://" + url
+    return url
 
+
+def _fetch_static_html(url: str) -> bytes:
     headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
-        ),
+        "User-Agent": _UA,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
         "Cache-Control": "max-age=0",
     }
-
+    response = None
     try:
         response = requests.get(url, headers=headers, timeout=15)
         response.raise_for_status()
+        return response.content
     except requests.exceptions.MissingSchema:
         raise ValueError(f"Invalid URL format: '{url}'. Please include http:// or https://")
     except requests.exceptions.InvalidURL:
@@ -246,9 +246,70 @@ def scrape_text_from_url(url: str) -> str:
     except requests.exceptions.RequestException as e:
         raise ValueError(f"Failed to fetch content from URL: {str(e)}")
 
-    # Parse HTML
+
+def _launch_browser(p):
+    """Try, in order: system Chromium (Linux/Streamlit Cloud), installed Chrome/Edge
+    (Windows/Mac), Playwright's own Chromium, then download it once and retry."""
+    import os, shutil, subprocess, sys
+    args = ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
+    attempts = []
+    for exe in ("/usr/bin/chromium", "/usr/bin/chromium-browser", shutil.which("chromium")):
+        if exe and os.path.exists(exe):
+            attempts.append({"executable_path": exe})
+    attempts += [{"channel": "chrome"}, {"channel": "msedge"}, {}]
+
+    last = None
+    for kw in attempts:
+        try:
+            return p.chromium.launch(headless=True, args=args, **kw)
+        except Exception as e:  # noqa: BLE001
+            last = e
+    try:  # one-time download of Playwright's Chromium
+        subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"],
+                       check=True, capture_output=True, timeout=300)
+        return p.chromium.launch(headless=True, args=args)
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError(f"No usable browser found ({last}; install attempt: {e})")
+
+
+def _render_html_playwright(url: str, timeout_ms: int = 45000) -> str:
+    """Load the page in headless Chromium so JavaScript runs, return final HTML."""
     try:
-        soup = BeautifulSoup(response.content, "html.parser")
+        from playwright.sync_api import sync_playwright
+    except ImportError as e:
+        raise RuntimeError("Playwright is not installed (pip install playwright).") from e
+
+    def _work():
+        with sync_playwright() as p:
+            browser = _launch_browser(p)
+            try:
+                ctx = browser.new_context(user_agent=_UA, locale="en-IN",
+                                          viewport={"width": 1366, "height": 900})
+                page = ctx.new_page()
+                # skip images/fonts/media: faster and not needed for text
+                page.route("**/*", lambda r: r.abort()
+                           if r.request.resource_type in ("image", "media", "font") else r.continue_())
+                page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+                try:  # wait until the app has actually rendered a decent amount of text
+                    page.wait_for_function(
+                        "document.body && document.body.innerText.length > 800",
+                        timeout=20000)
+                except Exception:  # noqa: BLE001
+                    pass
+                page.wait_for_timeout(1500)
+                return page.content()
+            finally:
+                browser.close()
+
+    # Run in a worker thread: avoids clashes with Streamlit's / Jupyter's event loop
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=1) as ex:
+        return ex.submit(_work).result(timeout=120)
+
+
+def _html_to_text(html, url: str) -> str:
+    try:
+        soup = BeautifulSoup(html, "html.parser")
 
         # Decompose script, style, noscript, svg, iframe
         for tag in soup(["script", "style", "noscript", "svg", "iframe"]):
@@ -310,3 +371,29 @@ def scrape_text_from_url(url: str) -> str:
         if isinstance(e, ValueError):
             raise e
         raise ValueError(f"Error parsing webpage HTML: {str(e)}")
+
+
+def scrape_text_from_url(url: str) -> str:
+    """Fetch a scheme page: fast static request first, headless browser (Playwright)
+    when the page is JavaScript-rendered, blocked (403) or returns almost no text."""
+    url = _normalize_url(url)
+
+    static_err, static_text = None, None
+    try:
+        static_text = _html_to_text(_fetch_static_html(url), url)
+        if len(static_text) >= MIN_STATIC_CHARS:
+            return static_text
+    except ValueError as e:
+        if "listing/search page" in str(e) or "Invalid" in str(e):
+            raise
+        static_err = e
+
+    try:
+        rendered = _render_html_playwright(url)
+    except Exception as pw_err:  # noqa: BLE001
+        if static_text and len(static_text) >= 15:
+            return static_text
+        reason = static_err or "page returned too little text"
+        raise ValueError(f"{reason}. Browser rendering also failed: {pw_err}")
+
+    return _html_to_text(rendered, url)
